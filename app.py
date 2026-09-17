@@ -26,6 +26,8 @@ st.sidebar.header("📅 Seleção de Data")
 data_selecionada = st.sidebar.date_input("Escolha o dia:", datetime.date.today())
 
 hoje_str = data_selecionada.strftime("%Y-%m-%d")
+# Muitas APIs da Rapid exigem data sem traços, vamos testar YYYYMMDD
+hoje_smart_str = data_selecionada.strftime("%Y%m%d") 
 lista_jogos = []
 
 # --- 1. Football-Data.org ---
@@ -57,10 +59,11 @@ if fd_key:
                 )
         else:
             st.sidebar.error(f"Erro Football-Data: Status {res_fd.status_code}")
-    except Exception:
-        pass
+    except Exception as e:
+        st.sidebar.error(f"Erro Local FD: {e}")
 
 # --- 2. RapidAPI (Smart API) ---
+debug_smart_data = None
 if rapid_key:
     url_smart = "https://free-api-live-football-data.p.rapidapi.com/football-get-matches-by-date"
     headers_smart = {
@@ -70,20 +73,28 @@ if rapid_key:
 
     try:
         res_smart = requests.get(
-            url_smart, headers=headers_smart, params={"date": hoje_str}
+            url_smart, headers=headers_smart, params={"date": hoje_smart_str}
         )
 
         if res_smart.status_code == 200:
             data = res_smart.json()
-            resp = data.get("response", {})
+            debug_smart_data = data  # Salva o pacote puro para o modo de diagnóstico
+
             raw_matches = []
+            if isinstance(data, list):
+                raw_matches = data
+            elif isinstance(data, dict):
+                # Busca recursiva básica pelas chaves mais comuns de APIs
+                if "response" in data and isinstance(data["response"], list):
+                    raw_matches = data["response"]
+                elif "response" in data and isinstance(data["response"], dict):
+                    raw_matches = data["response"].get("matches", [])
+                elif "matches" in data:
+                    raw_matches = data["matches"]
+                elif "data" in data:
+                    raw_matches = data["data"]
 
-            if isinstance(resp, list):
-                raw_matches = resp
-            elif isinstance(resp, dict):
-                raw_matches = resp.get("matches", []) or resp.get("list", [])
-
-            st.sidebar.success(f"Smart API: {len(raw_matches)} jogos")
+            st.sidebar.success(f"Smart API: {len(raw_matches)} jogos encontrados")
 
             for match in raw_matches:
                 time_casa = (
@@ -115,14 +126,13 @@ if rapid_key:
                 )
         else:
             st.sidebar.error(f"Erro Smart API: Status {res_smart.status_code}")
-    except Exception:
-        pass
+    except Exception as e:
+        st.sidebar.error(f"Erro Local Smart: {e}")
 
 # --- Exibição ---
 if lista_jogos:
     df = pd.DataFrame(lista_jogos).drop_duplicates(subset=["Confronto"])
 
-    # Filtros
     st.sidebar.header("🔍 Filtros de Análise")
     ligas = ["Todas"] + sorted(list(df["Liga"].dropna().unique()))
     liga_sel = st.sidebar.selectbox("Filtrar por Liga:", ligas)
@@ -156,4 +166,10 @@ if lista_jogos:
     else:
         st.warning("Nenhum jogo atende aos filtros de liga/horário selecionados.")
 else:
-    st.warning("Nenhum jogo encontrado para esta data nas APIs.")
+    st.warning("Nenhum jogo formatado encontrado para esta data.")
+    
+    # === GATILHO DE DIAGNÓSTICO ===
+    if debug_smart_data:
+        st.error("🚨 **Diagnóstico da Smart API** 🚨")
+        st.write("A conexão está verde e funcionando (Status 200), mas a estrutura dos dados recebidos mudou. Copie o bloco abaixo para ajustarmos:")
+        st.json(debug_smart_data)
