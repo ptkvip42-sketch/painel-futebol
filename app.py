@@ -26,7 +26,6 @@ st.sidebar.header("📅 Seleção de Data")
 data_selecionada = st.sidebar.date_input("Escolha o dia:", datetime.date.today())
 
 hoje_str = data_selecionada.strftime("%Y-%m-%d")
-# Muitas APIs da Rapid exigem data sem traços, vamos testar YYYYMMDD
 hoje_smart_str = data_selecionada.strftime("%Y%m%d") 
 lista_jogos = []
 
@@ -38,7 +37,7 @@ if fd_key:
         res_fd = requests.get(url_fd, headers=headers_fd)
         if res_fd.status_code == 200:
             matches_fd = res_fd.json().get("matches", [])
-            st.sidebar.success(f"Football-Data: {len(matches_fd)} jogos")
+            st.sidebar.success(f"Football-Data: {len(matches_fd)} jogos encontrados")
             for match in matches_fd:
                 utc_date = match.get("utcDate")
                 dt = pd.to_datetime(utc_date)
@@ -59,11 +58,10 @@ if fd_key:
                 )
         else:
             st.sidebar.error(f"Erro Football-Data: Status {res_fd.status_code}")
-    except Exception as e:
-        st.sidebar.error(f"Erro Local FD: {e}")
+    except Exception:
+        pass
 
 # --- 2. RapidAPI (Smart API) ---
-debug_smart_data = None
 if rapid_key:
     url_smart = "https://free-api-live-football-data.p.rapidapi.com/football-get-matches-by-date"
     headers_smart = {
@@ -78,25 +76,98 @@ if rapid_key:
 
         if res_smart.status_code == 200:
             data = res_smart.json()
-            debug_smart_data = data  # Salva o pacote puro para o modo de diagnóstico
+            
+            # Helper para extrair jogos quando estão aninhados dentro de ligas
+            def extrair_de_ligas(lista_ligas):
+                jogos = []
+                for liga in lista_ligas:
+                    nome_liga = liga.get("name") or liga.get("leagueName") or "Outras Ligas"
+                    for m in liga.get("matches", []):
+                        if isinstance(m, dict):
+                            m["_injected_league"] = nome_liga
+                            jogos.append(m)
+                return jogos
 
+            resp = data.get("response", data)
             raw_matches = []
-            if isinstance(data, list):
-                raw_matches = data
-            elif isinstance(data, dict):
-                # Busca recursiva básica pelas chaves mais comuns de APIs
-                if "response" in data and isinstance(data["response"], list):
-                    raw_matches = data["response"]
-                elif "response" in data and isinstance(data["response"], dict):
-                    raw_matches = data["response"].get("matches", [])
-                elif "matches" in data:
-                    raw_matches = data["matches"]
-                elif "data" in data:
-                    raw_matches = data["data"]
+            
+            # Navegação na Estrutura da Smart API
+            if isinstance(resp, list):
+                if len(resp) > 0 and "matches" in resp[0]:
+                    raw_matches = extrair_de_ligas(resp)
+                else:
+                    raw_matches = resp
+            elif isinstance(resp, dict):
+                if "leagues" in resp:
+                    raw_matches = extrair_de_ligas(resp["leagues"])
+                elif "matches" in resp:
+                    raw_matches = resp["matches"]
+                elif "list" in resp:
+                    raw_matches = resp["list"]
 
-            st.sidebar.success(f"Smart API: {len(raw_matches)} jogos encontrados")
+            st.sidebar.success(f"Smart API: {len(raw_matches)} jogos processados")
 
             for match in raw_matches:
+                # 1. Ajuste e Filtro Rigoroso de Data/Hora (UTC para BRT)
+                status_dict = match.get("status", {})
+                
+                if isinstance(status_dict, dict) and "utcTime" in status_dict:
+                    utc_time_str = status_dict.get("utcTime")
+                else:
+                    utc_time_str = match.get("time") or match.get("matchTime")
+                
+                try:
+                    dt = pd.to_datetime(utc_time_str)
+                    if dt.tzinfo is None:
+                        dt = dt.tz_localize("UTC")
+                    dt_local = dt.tz_convert("America/Sao_Paulo")
+                    
+                    # Filtro de Dia: Só aceita se for EXATAMENTE a data selecionada no fuso do Brasil
+                    if dt_local.strftime("%Y-%m-%d") != hoje_str:
+                        continue
+                        
+                    hora_str = dt_local.strftime("%H:%M")
+                    hora_int = dt_local.hour
+                except Exception:
+                    # Fallback de emergência
+                    raw_time = str(match.get("time", "00:00")).split(" ")
+                    hora_str = raw_time[-1] if len(raw_time) > 1 else raw_time[0]
+                    try:
+                        hora_int = int(hora_str.split(":")[0])
+                    except:
+                        hora_int = 12
+
+                # 2. Status Limpo (Extração de Placar e Tempo)
+                status_final = "AGENDADO"
+                if isinstance(status_dict, dict):
+                    reason = status_dict.get("reason", {}).get("short", "")
+                    score = status_dict.get("scoreStr", "")
+                    
+                    if score and reason:
+                        status_final = f"{score} ({reason})"
+                    elif score:
+                        status_final = score
+                    elif reason:
+                        status_final = reason
+                    elif status_dict.get("finished"):
+                        status_final = "Encerrado"
+                    elif status_dict.get("started"):
+                        status_final = "Em Andamento"
+                elif isinstance(status_dict, str):
+                    status_final = status_dict
+
+                # 3. Extração da Liga
+                liga = match.get("_injected_league")
+                if not liga:
+                    t_info = match.get("tournament") or match.get("league")
+                    if isinstance(t_info, dict):
+                        liga = t_info.get("name", "Outras Ligas")
+                    elif isinstance(t_info, str):
+                        liga = t_info
+                    else:
+                        liga = match.get("leagueName", "Outras Ligas")
+
+                # 4. Extração dos Times
                 time_casa = (
                     match.get("home", {}).get("name")
                     or match.get("homeTeam", {}).get("name")
@@ -107,31 +178,27 @@ if rapid_key:
                     or match.get("awayTeam", {}).get("name")
                     or "Time Fora"
                 )
-                liga = match.get("league", {}).get("name", "Outras Ligas")
-                hora_str = match.get("time", "00:00")
-                try:
-                    hora_int = int(str(hora_str).split(":")[0])
-                except Exception:
-                    hora_int = 12
 
                 lista_jogos.append(
                     {
-                        "Horário": str(hora_str),
+                        "Horário": hora_str,
                         "Hora_Int": hora_int,
                         "Liga": liga,
                         "Confronto": f"{time_casa} x {time_fora}",
-                        "Status": match.get("status", "AGENDADO"),
+                        "Status": status_final,
                         "Fonte": "Smart API",
                     }
                 )
         else:
             st.sidebar.error(f"Erro Smart API: Status {res_smart.status_code}")
-    except Exception as e:
-        st.sidebar.error(f"Erro Local Smart: {e}")
+    except Exception:
+        pass
 
-# --- Exibição ---
+# --- Renderização do Painel ---
 if lista_jogos:
-    df = pd.DataFrame(lista_jogos).drop_duplicates(subset=["Confronto"])
+    # Ordenação Cronológica e Remoção de Duplicados
+    df = pd.DataFrame(lista_jogos)
+    df = df.sort_values(by=["Hora_Int", "Horário"]).drop_duplicates(subset=["Confronto"])
 
     st.sidebar.header("🔍 Filtros de Análise")
     ligas = ["Todas"] + sorted(list(df["Liga"].dropna().unique()))
@@ -164,12 +231,6 @@ if lista_jogos:
             hide_index=True,
         )
     else:
-        st.warning("Nenhum jogo atende aos filtros de liga/horário selecionados.")
+        st.warning("Nenhum jogo atende aos filtros selecionados.")
 else:
-    st.warning("Nenhum jogo formatado encontrado para esta data.")
-    
-    # === GATILHO DE DIAGNÓSTICO ===
-    if debug_smart_data:
-        st.error("🚨 **Diagnóstico da Smart API** 🚨")
-        st.write("A conexão está verde e funcionando (Status 200), mas a estrutura dos dados recebidos mudou. Copie o bloco abaixo para ajustarmos:")
-        st.json(debug_smart_data)
+    st.warning("Nenhum jogo formatado encontrado para esta data nas APIs.")
