@@ -1,4 +1,5 @@
 import datetime
+import json
 import pandas as pd
 import requests
 import streamlit as st
@@ -38,16 +39,17 @@ if fd_key:
             matches_fd = res_fd.json().get("matches", [])
             for match in matches_fd:
                 utc_date = match.get("utcDate")
-                dt = pd.to_datetime(utc_date)
-                dt_local = dt.tz_convert("America/Sao_Paulo") if dt.tzinfo else dt - pd.Timedelta(hours=3)
-                lista_jogos.append({
-                    "Horário": dt_local.strftime("%H:%M"),
-                    "Hora_Int": dt_local.hour,
-                    "Liga": match.get("competition", {}).get("name", "Outras Ligas"),
-                    "Confronto": f"{match.get('homeTeam', {}).get('name')} x {match.get('awayTeam', {}).get('name')}",
-                    "Status": match.get("status", "SCHEDULED"),
-                    "Fonte": "Football-Data"
-                })
+                if utc_date:
+                    dt = pd.to_datetime(utc_date)
+                    dt_local = dt.tz_convert("America/Sao_Paulo") if dt.tzinfo else dt - pd.Timedelta(hours=3)
+                    lista_jogos.append({
+                        "Horário": dt_local.strftime("%H:%M"),
+                        "Hora_Int": dt_local.hour,
+                        "Liga": match.get("competition", {}).get("name", "Outras Ligas"),
+                        "Confronto": f"{match.get('homeTeam', {}).get('name')} x {match.get('awayTeam', {}).get('name')}",
+                        "Status": match.get("status", "Agendado"),
+                        "Fonte": "Football-Data"
+                    })
     except Exception:
         pass
 
@@ -59,7 +61,7 @@ if rapid_key:
         "x-rapidapi-host": "free-api-live-football-data.p.rapidapi.com",
     }
 
-    # O Truque do Fuso: Puxar o dia selecionado E o dia seguinte para garantir os jogos noturnos do Brasil
+    # Busca o dia selecionado e o dia seguinte para capturar a noite do Brasil
     data_seguinte = data_selecionada + datetime.timedelta(days=1)
     datas_para_buscar = [
         data_selecionada.strftime("%Y%m%d"),
@@ -67,7 +69,6 @@ if rapid_key:
     ]
 
     raw_matches = []
-    
     for data_api in datas_para_buscar:
         try:
             res_smart = requests.get(url_smart, headers=headers_smart, params={"date": data_api})
@@ -75,38 +76,48 @@ if rapid_key:
                 data = res_smart.json()
                 resp = data.get("response", data)
                 
-                # Caçador Profundo de Ligas
                 if isinstance(resp, dict) and "leagues" in resp:
                     for liga in resp["leagues"]:
                         nome_liga = liga.get("name") or liga.get("localizedName") or "Outras Ligas"
                         pais = liga.get("cc", "")
                         if pais and pais.lower() != "intl":
                             nome_liga = f"{pais.upper()} - {nome_liga}"
-                            
                         for m in liga.get("matches", []):
                             if isinstance(m, dict):
                                 m["_injected_league"] = nome_liga
                                 raw_matches.append(m)
                 elif isinstance(resp, list):
                     for item in resp:
-                        if "matches" in item and isinstance(item["matches"], list):
+                        if isinstance(item, dict) and "matches" in item:
                             nome_liga = item.get("name") or item.get("localizedName") or "Outras Ligas"
                             for m in item["matches"]:
                                 if isinstance(m, dict):
                                     m["_injected_league"] = nome_liga
                                     raw_matches.append(m)
-                        else:
+                        elif isinstance(item, dict):
                             raw_matches.append(item)
         except Exception:
             pass
 
-    # Processar os jogos pescados
     for match in raw_matches:
-        status_dict = match.get("status", {})
+        # Extração Segura de Hora/Data
+        utc_time_str = None
+        status_raw = match.get("status")
         
-        # 1. Filtro Rigoroso Brasil
-        utc_time_str = status_dict.get("utcTime") if isinstance(status_dict, dict) else match.get("time") or match.get("matchTime")
-        
+        if isinstance(status_raw, dict):
+            utc_time_str = status_raw.get("utcTime")
+        elif isinstance(status_raw, str):
+            try:
+                parsed_json = json.loads(status_raw)
+                if isinstance(parsed_json, dict):
+                    utc_time_str = parsed_json.get("utcTime")
+            except:
+                pass
+                
+        if not utc_time_str:
+            utc_time_str = match.get("time") or match.get("utcTime") or match.get("matchTime")
+
+        # Conversão para o Horário do Brasil
         try:
             dt = pd.to_datetime(utc_time_str)
             if dt.tzinfo is None:
@@ -119,23 +130,35 @@ if rapid_key:
             hora_str = dt_local.strftime("%H:%M")
             hora_int = dt_local.hour
         except Exception:
-            continue
+            # Fallback caso venha apenas string de horário simples
+            hora_str = str(match.get("time", "12:00"))[-5:]
+            try:
+                hora_int = int(hora_str.split(":")[0])
+            except:
+                hora_int = 12
 
-        # 2. Status Limpo
+        # Status Limpo e Amigável
         status_final = "Agendado"
-        if isinstance(status_dict, dict):
-            reason = status_dict.get("reason", {}).get("short", "")
-            score = status_dict.get("scoreStr", "")
+        if isinstance(status_raw, dict):
+            reason = status_raw.get("reason", {}).get("short", "")
+            score = status_raw.get("scoreStr", "")
             if score and reason:
                 status_final = f"{score} ({reason})"
             elif score:
                 status_final = score
             elif reason:
                 status_final = reason
-        elif isinstance(status_dict, str):
-            status_final = status_dict
+        elif isinstance(status_raw, str):
+            try:
+                p_json = json.loads(status_raw)
+                score = p_json.get("scoreStr", "")
+                reason = p_json.get("reason", {}).get("short", "")
+                if score:
+                    status_final = f"{score} ({reason})" if reason else score
+            except:
+                status_final = status_raw
 
-        # 3. Nome da Liga
+        # Nome da Liga
         liga = match.get("_injected_league")
         if not liga or liga == "Outras Ligas":
             t = match.get("tournament") or match.get("league") or match.get("competition")
@@ -146,7 +169,7 @@ if rapid_key:
             else:
                 liga = match.get("leagueName", "Outras Ligas")
 
-        # 4. Confronto
+        # Times
         time_casa = match.get("home", {}).get("name") or match.get("homeTeam", {}).get("name") or "Time Casa"
         time_fora = match.get("away", {}).get("name") or match.get("awayTeam", {}).get("name") or "Time Fora"
 
@@ -168,7 +191,7 @@ if lista_jogos:
     ligas = ["Todas"] + sorted(list(df["Liga"].dropna().unique()))
     liga_sel = st.sidebar.selectbox("Filtrar por Liga:", ligas)
 
-    # Nova janela de horário padronizada
+    # Janela padrão de 8h às 22h para cobrir todo o dia nobre
     intervalo_hora = st.sidebar.slider(
         "Janela de Horário (Horas):",
         min_value=0, max_value=23, value=(8, 22), format="%dh"
@@ -187,6 +210,6 @@ if lista_jogos:
     if not df_filtrado.empty:
         st.dataframe(df_filtrado[["Horário", "Liga", "Confronto", "Status", "Fonte"]], use_container_width=True, hide_index=True)
     else:
-        st.warning("Nenhum jogo atende aos filtros selecionados (Liga/Horário).")
+        st.warning("Nenhum jogo atende aos filtros de horário ou liga selecionados.")
 else:
-    st.warning("Nenhum jogo formatado encontrado para esta data nas APIs.")
+    st.warning("Nenhum jogo encontrado para esta data.")
