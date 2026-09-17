@@ -42,10 +42,14 @@ if fd_key:
                 if utc_date:
                     dt = pd.to_datetime(utc_date)
                     dt_local = dt.tz_convert("America/Sao_Paulo") if dt.tzinfo else dt - pd.Timedelta(hours=3)
+                    
+                    # Nome da Liga
+                    liga = match.get("competition", {}).get("name", "Outras Ligas")
+                    
                     lista_jogos.append({
                         "Horário": dt_local.strftime("%H:%M"),
                         "Hora_Int": dt_local.hour,
-                        "Liga": match.get("competition", {}).get("name", "Outras Ligas"),
+                        "Liga": liga,
                         "Confronto": f"{match.get('homeTeam', {}).get('name')} x {match.get('awayTeam', {}).get('name')}",
                         "Status": match.get("status", "Agendado"),
                         "Fonte": "Football-Data"
@@ -61,7 +65,7 @@ if rapid_key:
         "x-rapidapi-host": "free-api-live-football-data.p.rapidapi.com",
     }
 
-    # Busca o dia selecionado e o dia seguinte para capturar a noite do Brasil
+    # Truque do Fuso: Busca hoje e amanhã para garantir os jogos da noite no Brasil
     data_seguinte = data_selecionada + datetime.timedelta(days=1)
     datas_para_buscar = [
         data_selecionada.strftime("%Y%m%d"),
@@ -76,9 +80,10 @@ if rapid_key:
                 data = res_smart.json()
                 resp = data.get("response", data)
                 
+                # Extração recursiva de ligas e torneios
                 if isinstance(resp, dict) and "leagues" in resp:
                     for liga in resp["leagues"]:
-                        nome_liga = liga.get("name") or liga.get("localizedName") or "Outras Ligas"
+                        nome_liga = liga.get("name") or liga.get("localizedName") or liga.get("leagueName") or "Outras Ligas"
                         pais = liga.get("cc", "")
                         if pais and pais.lower() != "intl":
                             nome_liga = f"{pais.upper()} - {nome_liga}"
@@ -88,77 +93,75 @@ if rapid_key:
                                 raw_matches.append(m)
                 elif isinstance(resp, list):
                     for item in resp:
-                        if isinstance(item, dict) and "matches" in item:
-                            nome_liga = item.get("name") or item.get("localizedName") or "Outras Ligas"
-                            for m in item["matches"]:
-                                if isinstance(m, dict):
-                                    m["_injected_league"] = nome_liga
-                                    raw_matches.append(m)
-                        elif isinstance(item, dict):
-                            raw_matches.append(item)
+                        if isinstance(item, dict):
+                            if "matches" in item and isinstance(item["matches"], list):
+                                nome_liga = item.get("name") or item.get("localizedName") or "Outras Ligas"
+                                for m in item["matches"]:
+                                    if isinstance(m, dict):
+                                        m["_injected_league"] = nome_liga
+                                        raw_matches.append(m)
+                            else:
+                                raw_matches.append(item)
         except Exception:
             pass
 
     for match in raw_matches:
-        # Extração Segura de Hora/Data
+        # Extração Segura de Hora/Data (UTC)
         utc_time_str = None
         status_raw = match.get("status")
+        s_dict = {}
         
         if isinstance(status_raw, dict):
-            utc_time_str = status_raw.get("utcTime")
+            s_dict = status_raw
+            utc_time_str = s_dict.get("utcTime")
         elif isinstance(status_raw, str):
             try:
                 parsed_json = json.loads(status_raw)
                 if isinstance(parsed_json, dict):
-                    utc_time_str = parsed_json.get("utcTime")
+                    s_dict = parsed_json
+                    utc_time_str = s_dict.get("utcTime")
             except:
                 pass
                 
         if not utc_time_str:
             utc_time_str = match.get("time") or match.get("utcTime") or match.get("matchTime")
 
-        # Conversão para o Horário do Brasil
+        if not utc_time_str:
+            continue
+
+        # Conversão estricta para o Horário de Brasília (BRT)
         try:
             dt = pd.to_datetime(utc_time_str)
             if dt.tzinfo is None:
                 dt = dt.tz_localize("UTC")
             dt_local = dt.tz_convert("America/Sao_Paulo")
             
+            # Filtro rigoroso: Apenas jogos do dia escolhido no Brasil
             if dt_local.strftime("%Y-%m-%d") != hoje_str:
                 continue
                 
             hora_str = dt_local.strftime("%H:%M")
             hora_int = dt_local.hour
         except Exception:
-            # Fallback caso venha apenas string de horário simples
-            hora_str = str(match.get("time", "12:00"))[-5:]
-            try:
-                hora_int = int(hora_str.split(":")[0])
-            except:
-                hora_int = 12
+            continue
 
-        # Status Limpo e Amigável
+        # Status Limpo e Amigável (Placar + Estado)
         status_final = "Agendado"
-        if isinstance(status_raw, dict):
-            reason = status_raw.get("reason", {}).get("short", "")
-            score = status_raw.get("scoreStr", "")
-            if score and reason:
-                status_final = f"{score} ({reason})"
-            elif score:
-                status_final = score
-            elif reason:
-                status_final = reason
-        elif isinstance(status_raw, str):
-            try:
-                p_json = json.loads(status_raw)
-                score = p_json.get("scoreStr", "")
-                reason = p_json.get("reason", {}).get("short", "")
-                if score:
-                    status_final = f"{score} ({reason})" if reason else score
-            except:
-                status_final = status_raw
+        score = s_dict.get("scoreStr", "")
+        reason = s_dict.get("reason", {}).get("short", "")
+        
+        if score and reason:
+            status_final = f"{score} ({reason})"
+        elif score:
+            status_final = score
+        elif reason:
+            status_final = reason
+        elif s_dict.get("finished"):
+            status_final = "Encerrado"
+        elif s_dict.get("started"):
+            status_final = "Em Andamento"
 
-        # Nome da Liga
+        # Nome da Liga (Múltiplas tentativas para evitar "Outras Ligas")
         liga = match.get("_injected_league")
         if not liga or liga == "Outras Ligas":
             t = match.get("tournament") or match.get("league") or match.get("competition")
@@ -167,7 +170,7 @@ if rapid_key:
             elif isinstance(t, str):
                 liga = t
             else:
-                liga = match.get("leagueName", "Outras Ligas")
+                liga = match.get("leagueName") or match.get("categoryName") or "Outras Ligas"
 
         # Times
         time_casa = match.get("home", {}).get("name") or match.get("homeTeam", {}).get("name") or "Time Casa"
